@@ -1,0 +1,4 @@
+mcp
+pyobjc-framework-Cocoa
+pyobjc-framework-EventKit
+pyobjc-framework-Contacts
