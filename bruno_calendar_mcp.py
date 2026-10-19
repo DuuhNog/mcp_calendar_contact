@@ -26,10 +26,11 @@ from EventKit import (
 )
 
 # Foundation provides macOS date support (NSDate) used by EventKit.
-from Foundation import NSDate
+from Foundation import NSDate, NSTimeZone, NSURL
 
 # datetime to build time ranges in a readable way in Python.
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Literal
 
 # logging for debug: writes everything to a file you can follow live.
@@ -93,6 +94,23 @@ def _to_datetime(nsdate) -> datetime:
     return datetime.fromtimestamp(nsdate.timeIntervalSince1970())
 
 
+def _to_nsdate_in_tz(dt: datetime, tz) -> NSDate:
+    """Converts a naive wall-clock datetime to NSDate, interpreting that
+    wall-clock time IN the given NSTimeZone, rather than localizing it to
+    the device's zone and converting (which shifts the instant by the
+    offset difference between the two zones — see the reschedule_event/
+    create_event timezone gotcha in CLAUDE.md).
+
+    tz=None (floating) falls back to local-time interpretation, matching
+    EventKit's floating-event semantics (device-local wall clock, no
+    explicit zone).
+    """
+    if tz is None:
+        return _to_nsdate(dt)
+    aware = dt.replace(tzinfo=ZoneInfo(str(tz.name())))
+    return NSDate.dateWithTimeIntervalSince1970_(aware.timestamp())
+
+
 def _parse_dt(text: str) -> datetime:
     """Parses 'YYYY-MM-DD HH:MM' (or ISO 8601) into a datetime."""
     return datetime.fromisoformat(text.strip())
@@ -113,6 +131,30 @@ def _parse_alerts(text: str):
             raise ValueError("alert minutes cannot be negative")
         alarms.append(EKAlarm.alarmWithRelativeOffset_(-minutes * 60))
     return alarms
+
+
+_TIMEZONE_UNCHANGED = object()  # sentinel: caller passed '' (only relevant on reschedule)
+
+
+def _parse_timezone(text: str):
+    """Parses a timezone argument into an NSTimeZone, or None for 'floating'.
+
+    '' means "leave unchanged" (only meaningful on reschedule_event) and is
+    represented by the _TIMEZONE_UNCHANGED sentinel. 'floating'/'none' means
+    an explicit floating time (EventKit treats timeZone=nil as floating:
+    the event keeps the same wall-clock time in any time zone). Anything
+    else must be an IANA name (e.g. 'America/Sao_Paulo'). Raises ValueError
+    on an unrecognized name.
+    """
+    text = text.strip()
+    if not text:
+        return _TIMEZONE_UNCHANGED
+    if text.lower() in ("floating", "none"):
+        return None
+    tz = NSTimeZone.timeZoneWithName_(text)
+    if tz is None:
+        raise ValueError(f"unrecognized time zone '{text}'")
+    return tz
 
 
 def _find_event(event_id: str):
@@ -351,18 +393,29 @@ def create_calendar(
 # TOOL 2: list events within a range of days
 # =========================================================
 @mcp.tool()
-def list_events(days_ahead: int = 7) -> str:
+def list_events(days_ahead: int = 7, page: int = 1, page_size: int = 100) -> str:
     """Lists events for the next N days across all calendars.
 
     Each line includes the event id, needed by delete_event and
-    reschedule_event.
+    reschedule_event. Results are paginated to avoid oversized responses;
+    when the footer says more pages remain, call again with page+1 to
+    keep fetching until every page has been retrieved.
 
     Args:
         days_ahead: how many days ahead to search (default 7).
+        page: 1-based page number (default 1).
+        page_size: events per page (default 100, max 500).
     """
-    log.info("list_events(days_ahead=%d) called", days_ahead)
+    log.info(
+        "list_events(days_ahead=%d, page=%d, page_size=%d) called",
+        days_ahead, page, page_size,
+    )
     if not _ensure_access():
         return ACCESS_DENIED_MSG
+
+    if page < 1:
+        return "page must be >= 1."
+    page_size = max(1, min(page_size, 500))
 
     # Build the range: from now until now + days_ahead.
     start = datetime.now()
@@ -382,8 +435,26 @@ def list_events(days_ahead: int = 7) -> str:
 
     # Sort by start date.
     events = sorted(events, key=lambda e: e.startDate().timeIntervalSince1970())
-    lines = [_format_event(e) for e in events]
-    return f"Events (next {days_ahead} days):\n" + "\n".join(lines)
+    total = len(events)
+    total_pages = (total + page_size - 1) // page_size
+    if page > total_pages:
+        return f"Page {page} is out of range ({total_pages} page(s) total for {total} event(s))."
+
+    start_idx = (page - 1) * page_size
+    page_events = events[start_idx:start_idx + page_size]
+    lines = [_format_event(e) for e in page_events]
+
+    header = (
+        f"Events (next {days_ahead} days) {start_idx + 1}-{start_idx + len(lines)} "
+        f"of {total} (page {page}/{total_pages}):"
+    )
+    footer = ""
+    if page < total_pages:
+        footer = (
+            f"\n\nMore results available: call list_events(days_ahead={days_ahead}, "
+            f"page={page + 1}, page_size={page_size}) to continue."
+        )
+    return header + "\n" + "\n".join(lines) + footer
 
 
 # =========================================================
@@ -400,6 +471,10 @@ def create_event(
     repeat_interval: int = 1,
     repeat_until: str = "",
     alerts: str = "",
+    all_day: bool = False,
+    location: str = "",
+    timezone: str = "",
+    url: str = "",
 ) -> str:
     """Creates an event in Apple Calendar, optionally recurring.
 
@@ -418,10 +493,23 @@ def create_event(
         alerts: comma-separated minutes before the event to alert, e.g.
             '10' or '0,60' (0 = at the event's start time). Empty = no
             alert.
+        all_day: whether this is an all-day event. start/end are snapped to
+            midnight; for a single day, end can be left empty or equal to
+            start. For multiple days, end is exclusive (the day AFTER the
+            last day), e.g. start='2026-08-10', end='2026-08-13' covers
+            Aug 10-12.
+        location: optional free-text location.
+        timezone: IANA name (e.g. 'America/Sao_Paulo'). Empty = the
+            device's local time zone (default). 'floating' (or 'none')
+            makes the event keep the same wall-clock time regardless of
+            time zone — matches Calendar.app's "Floating" option, useful
+            for events abroad you want anchored to a fixed local time.
+        url: optional URL associated with the event.
     """
     log.info(
-        "create_event(title=%r, start=%r, end=%r, repeat=%r, alerts=%r) called",
-        title, start, end, repeat, alerts,
+        "create_event(title=%r, start=%r, end=%r, repeat=%r, alerts=%r, "
+        "all_day=%r, location=%r, timezone=%r, url=%r) called",
+        title, start, end, repeat, alerts, all_day, location, timezone, url,
     )
     if not _ensure_access():
         return ACCESS_DENIED_MSG
@@ -433,6 +521,20 @@ def create_event(
         return f"Invalid date format ({exc}). Use 'YYYY-MM-DD HH:MM'."
     if dt_end <= dt_start:
         return "End must be after start."
+
+    try:
+        tz = _parse_timezone(timezone)
+    except ValueError as exc:
+        return f"Invalid timezone ({exc}). Use an IANA name or 'floating'."
+
+    if all_day:
+        # EventKit all-day events need midnight-aligned dates; endDate is
+        # exclusive (the day AFTER the last day), matching iCal's DTEND.
+        day_start = dt_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = dt_end.replace(hour=0, minute=0, second=0, microsecond=0)
+        if day_end <= day_start:
+            day_end = day_start + timedelta(days=1)
+        dt_start, dt_end = day_start, day_end
 
     if calendar_id:
         calendar = store.calendarWithIdentifier_(calendar_id.strip())
@@ -450,15 +552,28 @@ def create_event(
     except ValueError as exc:
         return f"Invalid alerts ({exc}). Use comma-separated minutes, e.g. '10,60'."
 
+    # tz is a real NSTimeZone only when a specific one was requested;
+    # all-day events and the "leave unchanged" sentinel keep local-time
+    # interpretation (see _to_nsdate_in_tz).
+    dates_tz = None if (all_day or tz is _TIMEZONE_UNCHANGED) else tz
+
     event = EKEvent.eventWithEventStore_(store)
     event.setTitle_(title)
-    event.setStartDate_(_to_nsdate(dt_start))
-    event.setEndDate_(_to_nsdate(dt_end))
+    event.setStartDate_(_to_nsdate_in_tz(dt_start, dates_tz))
+    event.setEndDate_(_to_nsdate_in_tz(dt_end, dates_tz))
     event.setCalendar_(calendar)
     if notes:
         event.setNotes_(notes)
     if alarms:
         event.setAlarms_(alarms)
+    if all_day:
+        event.setAllDay_(True)
+    if location:
+        event.setLocation_(location)
+    if tz is not _TIMEZONE_UNCHANGED:
+        event.setTimeZone_(tz)
+    if url:
+        event.setURL_(NSURL.URLWithString_(url))
 
     repeat = repeat.strip().lower()
     recurrence_desc = ""
@@ -508,9 +623,18 @@ def create_event(
     if alarms:
         mins = ", ".join(chunk.strip() for chunk in alerts.split(",") if chunk.strip())
         alerts_desc = f", alerts at -{mins} min"
+    extra_desc = ""
+    if all_day:
+        extra_desc += ", all-day"
+    if location:
+        extra_desc += f", location '{location}'"
+    if tz is not _TIMEZONE_UNCHANGED:
+        extra_desc += ", floating time zone" if tz is None else f", time zone {tz.name()}"
+    if url:
+        extra_desc += f", url '{url}'"
     return (
         f"Event created: {title} on {dt_start:%d/%m/%Y %H:%M}–{dt_end:%H:%M}"
-        f" in '{calendar.title()}'{recurrence_desc}{alerts_desc}"
+        f" in '{calendar.title()}'{recurrence_desc}{alerts_desc}{extra_desc}"
         f" (id: {event.eventIdentifier()})"
     )
 
@@ -656,8 +780,13 @@ def reschedule_event(
     new_start: str,
     new_end: str = "",
     alerts: str = "",
+    all_day: Literal["", "true", "false"] = "",
+    location: str = "",
+    timezone: str = "",
+    url: str = "",
 ) -> str:
-    """Reschedules an existing event to a new date/time, and/or its alerts.
+    """Reschedules an existing event to a new date/time, and/or its alerts,
+    all-day flag, location, time zone, or URL.
 
     Args:
         event_id: the event id, as shown by list_events.
@@ -668,10 +797,21 @@ def reschedule_event(
             '10' or '0,60' (0 = at the event's start time). REPLACES the
             event's existing alerts. Leave empty to keep them unchanged;
             pass 'none' to remove all alerts.
+        all_day: 'true'/'false' to change the all-day flag. Leave empty to
+            keep it unchanged.
+        location: new location. Leave empty to keep it unchanged; pass
+            'none' to clear it.
+        timezone: IANA name (e.g. 'America/Sao_Paulo') to change the time
+            zone. Leave empty to keep it unchanged. 'floating' (or 'none')
+            makes the event keep the same wall-clock time regardless of
+            time zone — matches Calendar.app's "Floating" option.
+        url: new URL. Leave empty to keep it unchanged; pass 'none' to
+            clear it.
     """
     log.info(
-        "reschedule_event(event_id=%r, new_start=%r, new_end=%r, alerts=%r) called",
-        event_id, new_start, new_end, alerts,
+        "reschedule_event(event_id=%r, new_start=%r, new_end=%r, alerts=%r, "
+        "all_day=%r, location=%r, timezone=%r, url=%r) called",
+        event_id, new_start, new_end, alerts, all_day, location, timezone, url,
     )
     if not _ensure_access():
         return ACCESS_DENIED_MSG
@@ -704,11 +844,45 @@ def reschedule_event(
         except ValueError as exc:
             return f"Invalid alerts ({exc}). Use comma-separated minutes, e.g. '10,60'."
 
+    location = location.strip()
+    location_changed = bool(location)
+    new_location = "" if location.lower() == "none" else location
+
+    try:
+        tz = _parse_timezone(timezone)
+    except ValueError as exc:
+        return f"Invalid timezone ({exc}). Use an IANA name or 'floating'."
+    tz_changed = tz is not _TIMEZONE_UNCHANGED
+
+    all_day = all_day.strip().lower()
+    if all_day not in ("", "true", "false"):
+        return "Invalid all_day. Use 'true' or 'false'."
+    all_day_changed = bool(all_day)
+
+    url = url.strip()
+    url_changed = bool(url)
+    new_url = None if url.lower() == "none" else url
+
+    # Interpret new_start/new_end in whichever zone the event will end up
+    # with: the newly requested one, or (if timezone was left empty) the
+    # one it already had. All-day events keep local-time interpretation.
+    is_all_day = (all_day == "true") if all_day_changed else event.isAllDay()
+    effective_tz = tz if tz_changed else event.timeZone()
+    dates_tz = None if is_all_day else effective_tz
+
     old_start = _to_datetime(event.startDate())
-    event.setStartDate_(_to_nsdate(dt_start))
-    event.setEndDate_(_to_nsdate(dt_end))
+    event.setStartDate_(_to_nsdate_in_tz(dt_start, dates_tz))
+    event.setEndDate_(_to_nsdate_in_tz(dt_end, dates_tz))
     if alerts_changed:
         event.setAlarms_(alarms)
+    if location_changed:
+        event.setLocation_(new_location)
+    if tz_changed:
+        event.setTimeZone_(tz)
+    if all_day_changed:
+        event.setAllDay_(all_day == "true")
+    if url_changed:
+        event.setURL_(None if new_url is None else NSURL.URLWithString_(new_url))
 
     old_id = str(event.eventIdentifier())
     ok, err = store.saveEvent_span_commit_error_(event, EKSpanThisEvent, True, None)
@@ -745,9 +919,18 @@ def reschedule_event(
             alerts_desc = f", alerts set to -{mins} min"
         else:
             alerts_desc = ", alerts removed"
+    extra_desc = ""
+    if all_day_changed:
+        extra_desc += f", all-day set to {all_day}"
+    if location_changed:
+        extra_desc += f", location cleared" if not new_location else f", location set to '{new_location}'"
+    if tz_changed:
+        extra_desc += ", time zone set to floating" if tz is None else f", time zone set to {tz.name()}"
+    if url_changed:
+        extra_desc += ", url cleared" if new_url is None else f", url set to '{new_url}'"
     return (
         f"Event rescheduled: {title} moved from {old_start:%d/%m/%Y %H:%M}"
-        f" to {dt_start:%d/%m/%Y %H:%M}–{dt_end:%H:%M}{alerts_desc}"
+        f" to {dt_start:%d/%m/%Y %H:%M}–{dt_end:%H:%M}{alerts_desc}{extra_desc}"
     )
 
 

@@ -1,4 +1,4 @@
-# Instalação do Bruno Personal MCP (Calendário + Contatos)
+# Instalação do Bruno Personal MCP (Calendário + Contatos + Mail + Notes)
 
 Guia para instalar estes servidores MCP no Claude Desktop de um computador
 Mac novo (do cliente). Funciona apenas em **macOS**.
@@ -29,6 +29,8 @@ para `~/bruno_mcp/`. Ela deve conter pelo menos:
 bruno_mcp/
 ├── bruno_calendar_mcp.py
 ├── bruno_contact_mcp.py
+├── bruno_mail_mcp.py
+├── bruno_notes_mcp.py
 └── requirements.txt
 ```
 
@@ -47,7 +49,8 @@ python3 -m venv venv
 ```
 
 Isso instala o SDK do MCP (`mcp`) e os frameworks nativos do macOS via
-`pyobjc` (`EventKit` para calendário, `Contacts` para contatos).
+`pyobjc` (`EventKit` para calendário, `Contacts` para contatos,
+`ScriptingBridge` para Mail e Notes).
 
 ## 4. Confirmar o caminho do Python do ambiente virtual
 
@@ -85,14 +88,27 @@ para os do computador do cliente — use os caminhos obtidos nos passos 2 e 4):
       "args": [
         "/Users/cliente/bruno_mcp/bruno_contact_mcp.py"
       ]
+    },
+    "bruno-mail": {
+      "command": "/Users/cliente/bruno_mcp/venv/bin/python",
+      "args": [
+        "/Users/cliente/bruno_mcp/bruno_mail_mcp.py"
+      ]
+    },
+    "bruno-notes": {
+      "command": "/Users/cliente/bruno_mcp/venv/bin/python",
+      "args": [
+        "/Users/cliente/bruno_mcp/bruno_notes_mcp.py"
+      ]
     }
   }
 }
 ```
 
-Se o arquivo já existir com outras configurações, apenas adicione as duas
-chaves `"bruno-calendar"` e `"bruno-contact"` dentro do bloco `"mcpServers"`
-já existente, sem apagar o que já está lá.
+Se o arquivo já existir com outras configurações, apenas adicione as quatro
+chaves (`"bruno-calendar"`, `"bruno-contact"`, `"bruno-mail"`,
+`"bruno-notes"`) dentro do bloco `"mcpServers"` já existente, sem apagar o
+que já está lá.
 
 ## 6. Reiniciar o Claude Desktop
 
@@ -108,12 +124,23 @@ Se for negado por engano, libere manualmente em:
 **Ajustes do Sistema > Privacidade e Segurança > Calendários** (e
 **Contatos**) — marque o Claude/Claude Desktop como autorizado.
 
+Mail e Notes usam uma permissão diferente (**Automação**, não a mesma tela
+de Calendário/Contatos): na primeira vez que uma ferramenta de Mail ou
+Notes for usada, o macOS mostra um pop-up perguntando se o processo pode
+controlar "Mail" / "Notes". Aceite. Se negar por engano (ou se nada
+acontecer e as ferramentas sempre voltarem "nenhuma conta encontrada"),
+libere manualmente em **Ajustes do Sistema > Privacidade e Segurança >
+Automação** — procure a entrada correspondente ao Claude Desktop (ou ao
+Python do passo 4) e marque Mail/Notes como permitidos.
+
 ## 8. Testar
 
 Dentro do Claude Desktop, peça por exemplo:
 
 - "Liste meus calendários"
 - "Liste meus contatos"
+- "Liste minhas contas de e-mail"
+- "Liste minhas pastas de notas"
 
 Se aparecer a lista corretamente, a instalação funcionou.
 
@@ -135,3 +162,7 @@ Problemas comuns:
 - **"ModuleNotFoundError"**: as dependências não foram instaladas no
   ambiente virtual certo — repita o passo 3.
 - **Acesso negado a Calendário/Contatos**: revise o passo 7.
+- **Mail/Notes sempre retornam "nenhuma conta encontrada"**: ao contrário de
+  Calendário/Contatos, uma permissão de Automação negada não gera erro —
+  as ferramentas simplesmente voltam vazias. Revise a permissão de
+  Automação descrita no passo 7.

@@ -2,3 +2,4 @@ mcp
 pyobjc-framework-Cocoa
 pyobjc-framework-EventKit
 pyobjc-framework-Contacts
+pyobjc-framework-ScriptingBridge
